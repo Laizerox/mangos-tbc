@@ -6742,7 +6742,7 @@ SpellAuraHolder::SpellAuraHolder(SpellEntry const* spellproto, Unit* target, Wor
     m_auraSlot(MAX_AURAS), m_auraLevel(1),
     m_procCharges(0), m_stackAmount(1),
     m_timeCla(1000), m_removeMode(AURA_REMOVE_BY_DEFAULT), m_AuraDRGroup(DIMINISHING_NONE),
-    m_permanent(false), m_isRemovedOnShapeLost(true), m_deleted(false), m_in_use(0),
+    m_permanent(false), m_isRemovedOnShapeLost(true), m_deleted(false), m_in_use(0), m_heartBeatTimer(0),
     m_spellAuraHolderState(SPELLAURAHOLDER_STATE_CREATED)
 {
     MANGOS_ASSERT(target);
@@ -7334,6 +7334,9 @@ void SpellAuraHolder::Update(uint32 diff)
                 }
             }
 
+            if (m_duration && (m_spellProto->Attributes & SPELL_ATTR_HEARTBEAT_RESIST_CHECK))
+                HeartbeatResistance(diff);
+
             // Channeled aura required check distance from caster
             if (IsChanneledSpell(m_spellProto) && GetCasterGuid() != m_target->GetObjectGuid())
             {
@@ -7536,4 +7539,101 @@ void SpellAuraHolder::SendAuraDurationForCaster(Player* caster)
     data << uint32(GetAuraMaxDuration());                   // full
     data << uint32(GetAuraDuration());                      // remain
     caster->GetSession()->SendPacket(&data);
+}
+
+void SpellAuraHolder::HeartbeatResistance(uint32 diff)
+{
+    m_heartBeatTimer += diff;
+
+    if (m_heartBeatTimer < 950)
+        return;
+
+    if (SpellEntry const* spellProto = GetSpellProto())
+    {
+        Unit* target = GetTarget();
+        Unit* caster = GetCaster();
+
+        if (!target || !caster)
+            return;
+
+        if (target->GetTypeId() == TYPEID_UNIT && caster->GetTypeId() == TYPEID_PLAYER)
+        {
+            m_heartBeatTimer = 0;
+
+            size_t auraTimePassed = time(nullptr) - GetAuraApplyTime();
+
+            if (auraTimePassed == (uint32)floor((GetAuraMaxDuration() * 0.25 / IN_MILLISECONDS) + 0.5f) ||
+                auraTimePassed == (uint32)floor((GetAuraMaxDuration() * 0.50 / IN_MILLISECONDS) + 0.5f) ||
+                auraTimePassed == (uint32)floor((GetAuraMaxDuration() * 0.75 / IN_MILLISECONDS) + 0.5f))
+            {
+                DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "[Heartbeat Resist] Breaking creature aura. Duration %u, Max %u", (uint32)auraTimePassed, (GetAuraMaxDuration() / IN_MILLISECONDS));
+
+                SpellSchoolMask spellMask = GetSpellSchoolMask(spellProto);
+                uint32 pResistance = 0;
+
+                if (spellMask != SPELL_SCHOOL_MASK_NORMAL)
+                    pResistance = target->GetResistance(GetFirstSchoolInMask(spellMask));
+
+                uint32 breakChance = urand(0, 100);
+                uint32 breakPct = (5 + ((pResistance / powf(target->getLevel(), 1.441f) * 0.10) * 100));
+
+                if (breakChance < breakPct)
+                {
+                    target->RemoveAurasDueToSpellByCancel(spellProto->Id);
+                    DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "[Heartbeat Resist] Breaking creature aura %u. Seconds passed %u with chance %u and roll %u.", spellProto->Id, (uint32)auraTimePassed, breakPct, breakChance);
+                    return;
+                }
+            }
+        }
+        else if (target->GetTypeId() == TYPEID_PLAYER && caster->GetTypeId() == TYPEID_PLAYER)
+        {
+            m_heartBeatTimer = 0;
+
+            DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "[Heartbeat Resist] Trying to break aura #%u on player #%u", spellProto->Id, target->GetGUIDLow());
+
+            size_t heartbeatDelay = 5;
+            size_t auraTimePassed = time(nullptr) - GetAuraApplyTime();
+            int32 auraDuration = GetAuraMaxDuration() / IN_MILLISECONDS;
+
+            DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "[Heartbeat Resist] Aura duration %d and aura time passed currently %u", auraDuration, (uint32)auraTimePassed);
+
+            if (auraTimePassed < heartbeatDelay)
+                return;
+
+            SpellSchoolMask spellMask = GetSpellSchoolMask(spellProto);
+            uint32 pResistance = 0;
+
+            if (spellMask != SPELL_SCHOOL_MASK_NORMAL)
+                pResistance = target->GetResistance(GetFirstSchoolInMask(spellMask));
+
+            uint32 breakChance = urand(0, 100);
+
+            // Chance resist mechanic (select max value from every mechanic spell effect)
+            int32 pMechanicPct = 0;
+
+            // Get effects mechanic and chance
+            // [TODO] Identify if this is correct use.
+            for (int eff = 0; eff < MAX_EFFECT_INDEX; ++eff)
+            {
+                int32 effect_mech = GetEffectMechanic(spellProto, SpellEffectIndex(eff));
+                if (effect_mech)
+                {
+                    int32 temp = target->GetTotalAuraModifierByMiscValue(SPELL_AURA_MOD_MECHANIC_RESISTANCE, effect_mech);
+                    if (pMechanicPct < temp)
+                    pMechanicPct = temp;
+                }
+            }
+
+            float pResistancePct = (auraDuration - 5) * (pResistance / powf(target->getLevel(), 1.441f));
+            uint32 breakPct = (uint32)floor((100 * powf(auraTimePassed - heartbeatDelay, 2) / powf(auraDuration - heartbeatDelay, 2)) + (float)pResistancePct + (float)pMechanicPct + 0.5f) / 2;
+
+            if (breakChance < breakPct)
+            {
+                target->RemoveAurasDueToSpellByCancel(GetId());
+                DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "[Heartbeat Resist] Breaking aura %u. Seconds passed %u with chance %u and roll %u.", spellProto->Id, (uint32)auraTimePassed, breakPct, breakChance);
+                DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "[Heartbeat Resist] Resistance: %u Mechanic: %u Native: %u", (uint32)pResistancePct, pMechanicPct, (uint32)floor((100 * powf(auraTimePassed - heartbeatDelay, 2) / powf(15.f - heartbeatDelay, 2)) + 0.5f));
+                return;
+            }
+        }
+    }
 }

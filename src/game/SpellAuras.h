@@ -205,6 +205,7 @@ class MANGOS_DLL_SPEC SpellAuraHolder
         ~SpellAuraHolder();
     private:
         void UpdateAuraApplication();                       // called at charges or stack changes
+        void HeartbeatResistance(uint32 diff);
 
         SpellEntry const* m_spellProto;
 
@@ -234,6 +235,7 @@ class MANGOS_DLL_SPEC SpellAuraHolder
         bool m_deleted: 1;
 
         uint32 m_in_use;                                    // > 0 while in SpellAuraHolder::ApplyModifiers call/SpellAuraHolder::Update/etc
+        uint32 m_heartBeatTimer;                            // HeartbeatResist
 };
 
 typedef void(Aura::*pAuraHandler)(bool Apply, bool Real);
